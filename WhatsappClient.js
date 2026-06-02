@@ -38,6 +38,63 @@ function ffmpegPromise(inputPath, outputPath, options = []) {
     });
 }
 
+// Descarga el multimedia de un mensaje, lo guarda en ./media/ (convirtiendo
+// audio→mp3 y vídeo→3gp para compatibilidad con BB10) y enlaza el archivo en
+// la fila de messages vía media_filename. Decide el tipo por el MIME real del
+// archivo, no por message.type, para soportar también audios/imágenes enviados
+// desde la app (que WhatsApp puede reportar como 'document').
+// Usado tanto por el evento 'message' (recibidos) como por 'message_create' (enviados).
+async function persistMedia(message, newId) {
+    try {
+        const media = await message.downloadMedia();
+        if (!media || !media.mimetype) {
+            console.log(`[persistMedia ${newId}] sin media descargable`);
+            return;
+        }
+
+        const mime = media.mimetype;
+        let mediaFilename = null;
+
+        if (mime.startsWith('image/')) {
+            const ext = mime === 'image/webp' ? '.webp' : '.jpg';
+            mediaFilename = newId + ext;
+            fs.writeFileSync(path.join(MEDIA_DIR, mediaFilename), Buffer.from(media.data, 'base64'));
+        }
+
+        else if (mime.startsWith('audio/')) {
+            const srcPath  = path.join(MEDIA_DIR, newId + '.ogg');
+            const destPath = path.join(MEDIA_DIR, newId + '.mp3');
+            fs.writeFileSync(srcPath, Buffer.from(media.data, 'base64'));
+            await ffmpegPromise(srcPath, destPath, ['-codec:a libmp3lame']);
+            fs.unlinkSync(srcPath);
+            mediaFilename = newId + '.mp3';
+            console.log(`[persistMedia ${newId}] audio convertido a mp3`);
+        }
+
+        else if (mime.startsWith('video/')) {
+            const srcPath  = path.join(MEDIA_DIR, newId + '.mp4');
+            const destPath = path.join(MEDIA_DIR, newId + '.3gp');
+            fs.writeFileSync(srcPath, Buffer.from(media.data, 'base64'));
+            await ffmpegPromise(srcPath, destPath, [
+                '-s 352x288', '-acodec aac', '-strict experimental',
+                '-ac 1', '-ar 8000', '-ab 24k'
+            ]);
+            mediaFilename = newId + '.3gp';
+            console.log(`[persistMedia ${newId}] vídeo convertido a 3gp`);
+        }
+
+        if (mediaFilename) {
+            await getDb().run(
+                `UPDATE messages SET media_filename = ? WHERE _id = ?`,
+                [mediaFilename, newId]
+            );
+            console.log(`[persistMedia ${newId}] guardado: ${mediaFilename}`);
+        }
+    } catch (err) {
+        console.error(`[persistMedia ${newId}] error:`, err.message);
+    }
+}
+
 function startClient(id) {
     // Eliminar SingletonLock obsoleto si existe (evita "browser already running" tras crash)
     const lockFile = path.join(__dirname, '.wwebjs_auth', `session-${id}`, 'SingletonLock');
@@ -87,18 +144,27 @@ function startClient(id) {
 
         try {
             const contactName = await resolveContactName(clients[id], toAddr);
+            const chatType    = message.type || 'chat';
 
+            // El chat conserva unread_count=0: lo que YO envío no cuenta como no leído.
             await getDb().run('DELETE FROM chats WHERE sender = ?', [toAddr]);
             await getDb().run(
-                `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type)
-                 VALUES(?, ?, ?, ?, ?, ?, ?)`,
-                [toAddr, myAddr, msgText, 0, contactName, message.type || 'chat', message.deviceType || 'unknown']
+                `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, 0)`,
+                [toAddr, myAddr, msgText, 0, contactName, chatType, message.deviceType || 'unknown']
             );
-            await getDb().run(
+            const result = await getDb().run(
                 `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id)
                  VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-                [myAddr, toAddr, msgText, 0, pushname, message.type || 'chat', message.deviceType || 'unknown', waId || null]
+                [myAddr, toAddr, msgText, 0, pushname, chatType, message.deviceType || 'unknown', waId || null]
             );
+            const newId = result.lastID;
+
+            // Descargar y enlazar multimedia (imágenes enviadas desde la app, móvil, etc.)
+            if (message.hasMedia) {
+                await persistMedia(message, newId);
+            }
+
             console.log(`[message_create] guardado: ${pushname} → ${toAddr}: ${msgText.substring(0, 40)}`);
         } catch (err) {
             console.error('[message_create] error:', err.message);
@@ -180,57 +246,7 @@ function startClient(id) {
         const newId = result.lastID;
 
         if (message.hasMedia) {
-            try {
-                const media = await message.downloadMedia();
-
-                if (message.type === 'image') {
-                    let fileExt = '.jpg';
-                    if (media.mimetype === 'image/webp') fileExt = '.webp';
-
-                    const mediaFilename = newId + fileExt;
-                    fs.writeFileSync(path.join(MEDIA_DIR, mediaFilename), Buffer.from(media.data, 'base64'));
-
-                    await getDb().run(
-                        `UPDATE messages SET media_filename = ? WHERE _id = ?`,
-                        [mediaFilename, newId]
-                    );
-                }
-
-                else if (message.type === 'audio' || message.type === 'ptt') {
-                    const srcPath  = path.join(MEDIA_DIR, newId + '.ogg');
-                    const destPath = path.join(MEDIA_DIR, newId + '.mp3');
-
-                    fs.writeFileSync(srcPath, Buffer.from(media.data, 'base64'));
-                    await ffmpegPromise(srcPath, destPath, ['-codec:a libmp3lame']);
-                    fs.unlinkSync(srcPath);
-                    console.log("Audio conversion finished");
-
-                    await getDb().run(
-                        `UPDATE messages SET media_filename = ? WHERE _id = ?`,
-                        [newId + '.mp3', newId]
-                    );
-                }
-
-                else if (message.type === 'video') {
-                    const srcPath  = path.join(MEDIA_DIR, newId + '.mp4');
-                    const destPath = path.join(MEDIA_DIR, newId + '.3gp');
-
-                    fs.writeFileSync(srcPath, Buffer.from(media.data, 'base64'));
-                    await ffmpegPromise(srcPath, destPath, [
-                        '-s 352x288', '-acodec aac', '-strict experimental',
-                        '-ac 1', '-ar 8000', '-ab 24k'
-                    ]);
-                    console.log("Video conversion finished");
-
-                    await getDb().run(
-                        `UPDATE messages SET media_filename = ? WHERE _id = ?`,
-                        [newId + '.3gp', newId]
-                    );
-                }
-
-            } catch (err) {
-                console.error(`[msg ${newId}] Error saving media:`, err);
-            }
+            await persistMedia(message, newId);
         }
     });
 }
@@ -464,63 +480,56 @@ async function getContacts(mobileNumber, searchTerm, pageRaw, pageSizeRaw) {
 }
 
 async function uploadMedia(media, sender, receiver) {
+    // uploadMedia SOLO envía el archivo a WhatsApp. NO inserta en la BD:
+    // el evento 'message_create' (disparado por este mismo envío) se encarga de
+    // insertar la fila y descargar/guardar la copia permanente vía persistMedia.
+    // Este es el mismo patrón que sendMessage() para texto y evita duplicados.
+    let srcPath = null, targetPath = null;
     try {
         const client = clients[sender.replace("@c.us", "")];
         if (!client)
             return { status: 401, data: { statusCode: '002', statusDesc: 'User session not found' } };
 
-        let fileExt, fileExtTarget, msg, chatType;
+        let fileExt, fileExtTarget, chatType;
 
         if (media.mimetype === 'audio/mpeg') {
-            fileExt = '.mp3'; fileExtTarget = '.ogg'; msg = 'Audio sent'; chatType = 'audio';
+            fileExt = '.mp3'; fileExtTarget = '.ogg'; chatType = 'audio';
         } else if (media.mimetype === 'video/mp4') {
-            fileExt = '.mp4'; fileExtTarget = '.mp4'; msg = 'Video sent'; chatType = 'video';
+            fileExt = '.mp4'; fileExtTarget = '.mp4'; chatType = 'video';
         } else if (media.mimetype === 'image/jpeg') {
-            fileExt = '.jpg'; fileExtTarget = '.jpg'; msg = 'Image sent'; chatType = 'image';
+            fileExt = '.jpg'; fileExtTarget = '.jpg'; chatType = 'image';
         } else {
             return { status: 400, data: { statusCode: '004', statusDesc: 'Unsupported media type' } };
         }
 
-        const senderAddr   = normalizeAddr(sender);
-        const receiverAddr = normalizeAddr(receiver);
-
-        const newId      = Date.now(); // Use timestamp as ID for media files
-        const srcPath    = path.join(MEDIA_DIR, newId + fileExt);
-        const targetPath = path.join(MEDIA_DIR, newId + fileExtTarget);
+        // Archivos temporales (prefijo upload_) — se borran tras enviar.
+        const tmpId = 'upload_' + Date.now();
+        srcPath    = path.join(MEDIA_DIR, tmpId + fileExt);
+        targetPath = path.join(MEDIA_DIR, tmpId + fileExtTarget);
 
         fs.writeFileSync(srcPath, Buffer.from(media.data, 'binary'));
 
         if (media.mimetype === 'audio/mpeg') {
             await ffmpegPromise(srcPath, targetPath, ['-c:a libopus', '-b:a 128k']);
-            fs.unlinkSync(srcPath);
             console.log("Audio upload conversion finished");
         }
 
         const mediaObject = MessageMedia.fromFilePath(targetPath);
-        const sentMsg = await client.sendMessage(receiver, mediaObject);
+        const sendAsVoice = (chatType === 'audio') ? { sendAudioAsVoice: true } : {};
+        const sentMsg = await client.sendMessage(receiver, mediaObject, sendAsVoice);
         const waId = sentMsg?.id?._serialized || null;
 
-        // Insert into chats and messages with media_filename
-        const contactName = await resolveContactName(client, receiverAddr);
+        console.log(`[uploadMedia] enviado ${chatType} a ${receiver}, wa_id: ${waId} (persistencia vía message_create)`);
 
-        await getDb().run(`DELETE FROM chats WHERE sender = ?`, [receiverAddr]);
-        await getDb().run(
-            `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-            [receiverAddr, senderAddr, msg, 0, contactName, chatType, 'android', 0]
-        );
-
-        const result = await getDb().run(
-            `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, media_filename)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [senderAddr, receiverAddr, msg, 0, client.info.pushname, chatType, 'android', waId, newId + fileExtTarget]
-        );
-
-        return { status: 200, data: { statusCode: '000', statusDesc: 'media uploaded successfully' } };
+        return { status: 200, data: { statusCode: '000', statusDesc: 'media uploaded successfully', wa_id: waId } };
 
     } catch (error) {
         console.error(error);
         return { status: 500, data: { statusCode: '003', statusDesc: error.message } };
+    } finally {
+        // Limpieza de temporales; message_create guarda la copia definitiva.
+        try { if (srcPath)    fs.unlinkSync(srcPath); }    catch (_) {}
+        try { if (targetPath) fs.unlinkSync(targetPath); } catch (_) {}
     }
 }
 
@@ -543,6 +552,50 @@ async function resolveContactName(client, addr) {
     } catch (_) {}
 
     return addr; // último recurso: el número en bruto
+}
+
+// Obtiene la URL de la foto de perfil sin usar client.getProfilePicUrl(),
+// que está roto en esta build de WhatsApp Web (lanza "Cannot read ... 'isNewsletter'"
+// dentro de requestProfilePicFromServer). El camino que SÍ funciona es
+// window.Store.ProfilePicThumb.find(wid), que devuelve un modelo con .eurl.
+// Probamos también con el id resuelto @lid → @c.us (que da el número real).
+async function fetchProfilePicUrlSafe(client, contactId) {
+    const candidates = [];
+
+    if (contactId.includes('@lid')) {
+        // El número real se resuelve vía getContactById(lid).number (verificado).
+        try {
+            const contact = await client.getContactById(contactId);
+            if (contact?.number) candidates.push(contact.number + '@c.us');
+        } catch (_) {}
+    }
+    candidates.push(contactId); // siempre probar también el id original
+
+    for (const cid of candidates) {
+        try {
+            const eurl = await client.pupPage.evaluate(async (id) => {
+                try {
+                    const wid = window.Store.WidFactory.createWid(id);
+                    // window.Store.ProfilePicThumb.find(wid) es el camino que SÍ funciona
+                    // en esta build de WhatsApp Web (getProfilePicUrl/requestProfilePicFromServer
+                    // lanzan "isNewsletter" sobre undefined). Devuelve un modelo con .eurl.
+                    const thumb = await window.Store.ProfilePicThumb.find(wid);
+                    return thumb && thumb.eurl ? thumb.eurl : null;
+                } catch (e) {
+                    return null;
+                }
+            }, cid);
+
+            if (eurl) {
+                console.log(`[profilepic] URL obtenida vía ${cid}`);
+                return eurl;
+            }
+            console.log(`[profilepic] sin URL para candidato ${cid}`);
+        } catch (e) {
+            console.log(`[profilepic] evaluate falló para ${cid}: ${e.message}`);
+        }
+    }
+    return null;
 }
 
 async function getProfilePic(mobileNumber, contactId) {
@@ -575,44 +628,12 @@ async function getProfilePic(mobileNumber, contactId) {
             console.log(`[profilepic] STEP 2: caché miss (${e.message})`);
         }
 
-        // Obtener URL de foto desde la API de WA
-        console.log(`[profilepic] STEP 3: llamando getProfilePicUrl(${contactId})`);
-        let url = null;
-        try {
-            url = await client.getProfilePicUrl(contactId);
-            if (url) {
-                console.log(`[profilepic] STEP 3 OK: URL obtenida (${url.substring(0, 60)}...)`);
-            } else {
-                console.log(`[profilepic] STEP 3: getProfilePicUrl devolvió null/undefined`);
-            }
-        } catch (err) {
-            console.error(`[profilepic] STEP 3 ERROR: ${err.name}: ${err.message}`);
-            console.error(`[profilepic] STEP 3 Stack:`, err.stack);
-        }
-
-        // Fallback: @lid → número de teléfono
-        if (!url && contactId.includes('@lid')) {
-            console.log(`[profilepic] STEP 4: intentando fallback @lid → @c.us`);
-            try {
-                const contact = await client.getContactById(contactId);
-                console.log(`[profilepic] STEP 4: contacto obtenido:`, contact?.number ? 'sí' : 'no');
-                if (contact?.number) {
-                    const phoneAddr = contact.number + '@c.us';
-                    console.log(`[profilepic] STEP 4: llamando getProfilePicUrl(${phoneAddr})`);
-                    url = await client.getProfilePicUrl(phoneAddr);
-                    if (url) {
-                        console.log(`[profilepic] STEP 4 OK: URL obtenida via fallback`);
-                    } else {
-                        console.log(`[profilepic] STEP 4: fallback devolvió null`);
-                    }
-                }
-            } catch (err) {
-                console.error(`[profilepic] STEP 4 ERROR: ${err.name}: ${err.message}`);
-            }
-        }
+        // Obtener URL de foto (workaround del bug isNewsletter de getProfilePicUrl)
+        console.log(`[profilepic] STEP 3: resolviendo URL para ${contactId}`);
+        const url = await fetchProfilePicUrlSafe(client, contactId);
 
         if (!url) {
-            console.log(`[profilepic] FAIL: No URL disponible para ${contactId} (probablemente privacidad o no guardado)`);
+            console.log(`[profilepic] FAIL: No URL disponible para ${contactId} (privacidad, sin foto, o build de WA incompatible)`);
             return { status: 404 };
         }
 
@@ -769,27 +790,42 @@ async function getContactInfo(mobileNumber, contactId) {
     try {
         const regex = /;interface=wifi/gi;
         mobileNumber = mobileNumber.replace(regex, "");
+        contactId    = contactId.replace(regex, "");
         const client = clients[mobileNumber.replace("@c.us", "")];
         if (!client) return { status: 401, data: { error: "User session not found" } };
 
         let name = "", phone = "", about = "";
 
+        // 1) Resolver el contacto. Para @lid, getContactById(lid).number devuelve
+        //    el TELÉFONO REAL (verificado: 222337689452755@lid → 34664687499).
         try {
             const contact = await client.getContactById(contactId);
             if (contact) {
                 name  = contact.name || contact.pushname || "";
                 phone = contact.number ? `+${contact.number}` : "";
-                try { about = await contact.getAbout() || ""; } catch (_) {}
+                try { about = (await contact.getAbout()) || ""; } catch (_) {}
             }
-        } catch (_) {
-            // @lid o contacto no disponible
+        } catch (e) {
+            console.log(`[contactinfo] getContactById falló para ${contactId}: ${e.message}`);
         }
 
-        // Fallback: extraer número del formato @c.us
+        // 2) Fallback del teléfono: si el id ya es @c.us, el número está en el id.
         if (!phone && contactId.includes('@c.us')) {
             phone = `+${contactId.replace('@c.us', '')}`;
         }
 
+        // 3) Fallback del nombre: nombre guardado en mensajes previos.
+        if (!name) {
+            try {
+                const row = await getDb().get(
+                    `SELECT sender_name FROM messages WHERE sender = ? AND sender_name IS NOT NULL LIMIT 1`,
+                    [contactId]
+                );
+                if (row?.sender_name) name = row.sender_name;
+            } catch (_) {}
+        }
+
+        console.log(`[contactinfo] ${contactId} → name="${name}" phone="${phone}" about="${about.substring(0,30)}"`);
         return { status: 200, data: { name, phone, about } };
     } catch (error) {
         return { status: 500, data: { error: error.message } };
