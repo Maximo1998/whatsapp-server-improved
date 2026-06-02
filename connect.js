@@ -73,6 +73,12 @@ async function initializeDatabase() {
         await db.exec(`ALTER TABLE chats ADD COLUMN unread_count INTEGER DEFAULT 0`);
         console.log(`chats: columna unread_count añadida.`);
     } catch (_) {}
+    try {
+        // Dirección del último mensaje del chat: 1 = lo envié yo, 0 = lo recibí.
+        // Permite a la app no notificar mensajes enviados desde otros dispositivos.
+        await db.exec(`ALTER TABLE chats ADD COLUMN last_from_me INTEGER DEFAULT 0`);
+        console.log(`chats: columna last_from_me añadida.`);
+    } catch (_) {}
 
     // Indexes
     await db.exec(`CREATE INDEX IF NOT EXISTS idx_chats_receiver  ON chats(receiver)`);
