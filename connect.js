@@ -6,7 +6,6 @@ const fs = require("fs");
 let db;
 
 async function initializeDatabase() {
-    // create data folder if it doesn't exist
     const dataPath = `${__dirname}/data`;
 
     try {
@@ -16,7 +15,6 @@ async function initializeDatabase() {
         } else {
             console.log(`Folder '${dataPath}' already exists.`);
         }
-
     } catch (err) {
         console.log('Error creating data folder:', err);
         process.exit(1);
@@ -28,20 +26,17 @@ async function initializeDatabase() {
     });
     console.log(`connected to database.`)
 
-    let sql = `CREATE TABLE IF NOT EXISTS users (
+    await db.exec(`CREATE TABLE IF NOT EXISTS users (
         _id INTEGER PRIMARY KEY AUTOINCREMENT,
         uuid TEXT NOT NULL,
         pushname TEXT NOT NULL,
         user TEXT NOT NULL,
         platform TEXT NOT NULL,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`;
-
-    await db.exec(sql);
+    )`);
     console.log(`users table created.`);
 
-
-    sql = `CREATE TABLE IF NOT EXISTS chats (
+    await db.exec(`CREATE TABLE IF NOT EXISTS chats (
         _id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender TEXT NOT NULL,
         receiver TEXT NOT NULL,
@@ -51,13 +46,10 @@ async function initializeDatabase() {
         chat_type TEXT NOT NULL,
         device_type TEXT NOT NULL,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`;
-
-    await db.exec(sql);
+    )`);
     console.log(`chats table created.`);
 
-
-    sql = `CREATE TABLE IF NOT EXISTS messages (
+    await db.exec(`CREATE TABLE IF NOT EXISTS messages (
         _id INTEGER PRIMARY KEY AUTOINCREMENT,
         sender TEXT NOT NULL,
         receiver TEXT NOT NULL,
@@ -66,16 +58,29 @@ async function initializeDatabase() {
         sender_name TEXT NOT NULL,
         chat_type TEXT NOT NULL,
         device_type TEXT NOT NULL,
+        media_filename TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`;
-
-    await db.exec(sql);
+    )`);
     console.log(`messages table created.`);
-    /*
-    sql = `update chats set timestamp='2025-09-01 09:10:11'  where _id=35`;
-    await db.exec(sql);
-    console.log(`custom sql executed`);
-    */
+
+    // Migrations
+    try { await db.exec(`ALTER TABLE messages ADD COLUMN media_filename TEXT`); } catch (_) {}
+    try {
+        await db.exec(`ALTER TABLE messages ADD COLUMN wa_id TEXT`);
+        console.log(`messages: columna wa_id añadida.`);
+    } catch (_) {}
+    try {
+        await db.exec(`ALTER TABLE chats ADD COLUMN unread_count INTEGER DEFAULT 0`);
+        console.log(`chats: columna unread_count añadida.`);
+    } catch (_) {}
+
+    // Indexes
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_chats_receiver  ON chats(receiver)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_chats_sender    ON chats(sender)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_conv   ON messages(receiver, sender)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_conv2  ON messages(sender, receiver)`);
+    await db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id  ON messages(wa_id)`);
+    console.log(`indexes ready.`);
 }
 
 module.exports = {
