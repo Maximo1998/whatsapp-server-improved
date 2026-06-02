@@ -27,6 +27,26 @@ function normalizeAddr(addr) {
     return addr + '@c.us';                 // número sin sufijo → añadir @c.us
 }
 
+// Zona horaria de visualización. El cliente (BlackBerry Q20) tiene una base de
+// datos de zonas horarias obsoleta y aplica mal el horario de verano (muestra la
+// hora 1h atrasada). Por eso el SERVIDOR es la fuente de la hora: formatea los
+// timestamps en esta zona y la app los muestra tal cual, sin reconvertir.
+const DISPLAY_TZ = process.env.DISPLAY_TZ || 'Europe/Madrid';
+
+// Devuelve 'YYYY-MM-DD HH:MM:SS' en DISPLAY_TZ. Usa Intl (ICU incluido en Node 20),
+// así no depende de tzdata del sistema operativo.
+function fmtTs(date = new Date()) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: DISPLAY_TZ, hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit'
+    }).formatToParts(date);
+    const v = t => parts.find(p => p.type === t).value;
+    // 'en-CA' da hora 24h; algunos ICU devuelven '24' a medianoche → normalizar.
+    const hh = v('hour') === '24' ? '00' : v('hour');
+    return `${v('year')}-${v('month')}-${v('day')} ${hh}:${v('minute')}:${v('second')}`;
+}
+
 function ffmpegPromise(inputPath, outputPath, options = []) {
     return new Promise((resolve, reject) => {
         let cmd = ffmpeg().input(inputPath);
@@ -146,17 +166,18 @@ function startClient(id) {
             const contactName = await resolveContactName(clients[id], toAddr);
             const chatType    = message.type || 'chat';
 
-            // El chat conserva unread_count=0: lo que YO envío no cuenta como no leído.
+            // unread_count=0 y last_from_me=1: lo que YO envío no es no leído ni se notifica.
+            const ts = fmtTs();
             await getDb().run('DELETE FROM chats WHERE sender = ?', [toAddr]);
             await getDb().run(
-                `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count)
-                 VALUES(?, ?, ?, ?, ?, ?, ?, 0)`,
-                [toAddr, myAddr, msgText, 0, contactName, chatType, message.deviceType || 'unknown']
+                `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count, last_from_me, timestamp)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, 0, 1, ?)`,
+                [toAddr, myAddr, msgText, 0, contactName, chatType, message.deviceType || 'unknown', ts]
             );
             const result = await getDb().run(
-                `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id)
-                 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-                [myAddr, toAddr, msgText, 0, pushname, chatType, message.deviceType || 'unknown', waId || null]
+                `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, timestamp)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [myAddr, toAddr, msgText, 0, pushname, chatType, message.deviceType || 'unknown', waId || null, ts]
             );
             const newId = result.lastID;
 
@@ -231,16 +252,17 @@ function startClient(id) {
             [message.from]
         );
 
+        const ts = fmtTs();
         await getDb().run(
-            `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-            [message.from, message.to, msg, 0, senderNameForChat, message.type, message.deviceType, newUnreadCount]
+            `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count, last_from_me, timestamp)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+            [message.from, message.to, msg, 0, senderNameForChat, message.type, message.deviceType, newUnreadCount, ts]
         );
 
         const result = await getDb().run(
-            `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-            [message.from, message.to, msg, 0, senderNameForMessages, message.type, message.deviceType, waId]
+            `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, timestamp)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [message.from, message.to, msg, 0, senderNameForMessages, message.type, message.deviceType, waId, ts]
         );
 
         const newId = result.lastID;
@@ -350,13 +372,15 @@ async function getChats(receiver, pageRaw, pageSizeRaw) {
         );
 
         const chats = rows.map(row => ({
-            _id:        row._id,
-            sender:     row.sender,
-            senderName: row.sender_name,
-            message:    row.message,
-            status:     row.status,
-            createdAt:  row.timestamp,
-            updatedAt:  row.timestamp
+            _id:         row._id,
+            sender:      row.sender,
+            senderName:  row.sender_name,
+            message:     row.message,
+            status:      row.status,
+            unreadCount: row.unread_count || 0,
+            lastFromMe:  row.last_from_me || 0,
+            createdAt:   row.timestamp,
+            updatedAt:   row.timestamp
         }));
 
         return { status: 200, data: { chats } };
@@ -709,8 +733,7 @@ async function syncHistory(id) {
                         ? (client.info.pushname || 'Me')
                         : (msg._data?.notifyName || contactName);
                     const msgText    = msg.type === 'chat' ? (msg.body || '') : `${msg.type} received`;
-                    const timestamp  = new Date(msg.timestamp * 1000)
-                        .toISOString().replace('T', ' ').substring(0, 19);
+                    const timestamp  = fmtTs(new Date(msg.timestamp * 1000));
 
                     await getDb().run(
                         `INSERT INTO messages
@@ -724,8 +747,7 @@ async function syncHistory(id) {
                 // Actualizar chats con el último mensaje del contacto
                 if (lastMsg) {
                     const msgText   = lastMsg.type === 'chat' ? (lastMsg.body || '') : `${lastMsg.type} received`;
-                    const timestamp = new Date(lastMsg.timestamp * 1000)
-                        .toISOString().replace('T', ' ').substring(0, 19);
+                    const timestamp = fmtTs(new Date(lastMsg.timestamp * 1000));
 
                     const existing = await getDb().get(
                         `SELECT _id FROM chats WHERE sender = ?`, [contactAddr]
@@ -733,9 +755,10 @@ async function syncHistory(id) {
                     if (!existing) {
                         await getDb().run(
                             `INSERT INTO chats
-                             (sender, receiver, message, status, sender_name, chat_type, device_type, timestamp)
-                             VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-                            [contactAddr, myAddr, msgText, 0, contactName, lastMsg.type || 'chat', 'history', timestamp]
+                             (sender, receiver, message, status, sender_name, chat_type, device_type, last_from_me, timestamp)
+                             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            [contactAddr, myAddr, msgText, 0, contactName, lastMsg.type || 'chat', 'history',
+                             lastMsg.fromMe ? 1 : 0, timestamp]
                         );
                     }
                 }
