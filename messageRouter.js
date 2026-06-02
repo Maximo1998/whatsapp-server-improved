@@ -124,7 +124,11 @@ router.get('/api/chats/:receiver', async (req, res) => {
 });
 
 router.get('/api/contacts/:user', async (req, res) => {
-    const pageSize    = parseIntParam(req.query.page_size, 30);
+    // La app carga TODOS los contactos guardados de una vez y filtra la búsqueda
+    // en local, por lo que el endpoint devuelve la lista completa por defecto
+    // (los contactos guardados son una lista acotada, ~300). Antes el default de 30
+    // hacía que solo se vieran los primeros (hasta la "A").
+    const pageSize    = parseIntParam(req.query.page_size, 100000);
     const page        = parseIntParam(req.query.page, 0);
     const searchTerm  = String(req.query.search_term ?? '').replace(BB_WIFI_REGEX, "");
     const result      = await getContacts(req.params.user, searchTerm, page, pageSize);
