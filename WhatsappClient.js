@@ -484,10 +484,15 @@ async function getContacts(mobileNumber, searchTerm, pageRaw, pageSizeRaw) {
 
         const contacts = await client.getContacts();
 
+        // Solo contactos GUARDADOS en la agenda del usuario (isMyContact).
+        // isWAContact incluía a CUALQUIER usuario de WhatsApp con quien se ha tenido
+        // contacto (miembros de grupos, gente que escribió, etc.) → 3500+ números random.
+        // Excluimos también nuestra propia cuenta y grupos, y usamos la identidad @c.us.
         const filtered = contacts
-            .filter(c => c.isWAContact && c.id.server !== "lid" && !c.isBusiness)
+            .filter(c => c.isMyContact && !c.isMe && !c.isGroup && c.id.server === "c.us")
             .map(c => ({ id: c.id._serialized, name: c.name ?? c.pushname ?? c.id.user }))
-            .filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase()));
+            .filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase()))
+            .sort((a, b) => a.name.localeCompare(b.name));
 
         const { page, pageSize } = parsePagination(pageRaw, pageSizeRaw);
         const start = page * pageSize;
