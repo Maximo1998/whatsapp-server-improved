@@ -178,15 +178,21 @@ router.get('/listusers', async (req, res) => {
 // Reset unread count when user opens a chat
 router.post('/api/mark-read/:user/:contactId', async (req, res) => {
     try {
-        const user = req.params.user.replace(BB_WIFI_REGEX, "");
+        const userRaw   = req.params.user.replace(BB_WIFI_REGEX, "");
         const contactId = req.params.contactId.replace(BB_WIFI_REGEX, "");
 
+        // La app ya envía el usuario como "<numero>@c.us". Antes el servidor le
+        // volvía a añadir "@c.us" → "<numero>@c.us@c.us", que no coincidía con
+        // ninguna fila y por eso la bolita de no-leídos NO se reseteaba al entrar.
+        const receiver = userRaw.includes('@') ? userRaw : userRaw + '@c.us';
+
         const { db } = require('./connect');
-        await db().run(
+        const result = await db().run(
             `UPDATE chats SET unread_count = 0 WHERE sender = ? AND receiver = ?`,
-            [contactId, user + '@c.us']
+            [contactId, receiver]
         );
-        res.status(200).json({ status: 'ok' });
+        console.log(`[mark-read] ${contactId} (receiver ${receiver}) → filas afectadas: ${result.changes}`);
+        res.status(200).json({ status: 'ok', changed: result.changes });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: error.message });
