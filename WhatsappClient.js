@@ -75,7 +75,25 @@ async function persistMedia(message, newId) {
         const mime = media.mimetype;
         let mediaFilename = null;
 
-        if (mime.startsWith('image/')) {
+        // Stickers (webp, a veces animados): convertir a PNG para preservar la
+        // transparencia y garantizar el render en el runtime viejo de BB10. De los
+        // animados se queda el primer fotograma (-frames:v 1). Fallback al webp.
+        if (message.type === 'sticker') {
+            const srcPath = path.join(MEDIA_DIR, newId + '.webp');
+            const pngPath = path.join(MEDIA_DIR, newId + '.png');
+            fs.writeFileSync(srcPath, Buffer.from(media.data, 'base64'));
+            try {
+                await ffmpegPromise(srcPath, pngPath, ['-frames:v 1', '-update 1']);
+                fs.unlinkSync(srcPath);
+                mediaFilename = newId + '.png';
+                console.log(`[persistMedia ${newId}] sticker convertido a png`);
+            } catch (e) {
+                mediaFilename = newId + '.webp';
+                console.log(`[persistMedia ${newId}] sticker→png falló, usando webp: ${e.message}`);
+            }
+        }
+
+        else if (mime.startsWith('image/')) {
             const ext = mime === 'image/webp' ? '.webp' : '.jpg';
             mediaFilename = newId + ext;
             fs.writeFileSync(path.join(MEDIA_DIR, mediaFilename), Buffer.from(media.data, 'base64'));
@@ -112,6 +130,29 @@ async function persistMedia(message, newId) {
         }
     } catch (err) {
         console.error(`[persistMedia ${newId}] error:`, err.message);
+    }
+}
+
+// Extrae la info de cita (reply) de un mensaje, si responde a otro.
+// Devuelve { quotedMessage, quotedAuthor } o { null, null }.
+// quotedMessage es una vista previa de texto; para media se usa un marcador.
+async function extractQuoted(message, client) {
+    try {
+        if (!message.hasQuotedMsg) return { quotedMessage: null, quotedAuthor: null };
+        const quoted = await message.getQuotedMessage();
+        if (!quoted) return { quotedMessage: null, quotedAuthor: null };
+
+        let preview;
+        if (quoted.type === 'chat') preview = (quoted.body || '').substring(0, 120);
+        else                        preview = `[${quoted.type}]`;
+
+        let author;
+        if (quoted.fromMe) author = client?.info?.pushname || 'Me';
+        else               author = quoted._data?.notifyName || '';
+
+        return { quotedMessage: preview, quotedAuthor: author };
+    } catch (_) {
+        return { quotedMessage: null, quotedAuthor: null };
     }
 }
 
@@ -165,6 +206,7 @@ function startClient(id) {
         try {
             const contactName = await resolveContactName(clients[id], toAddr);
             const chatType    = message.type || 'chat';
+            const { quotedMessage, quotedAuthor } = await extractQuoted(message, clients[id]);
 
             // unread_count=0 y last_from_me=1: lo que YO envío no es no leído ni se notifica.
             const ts = fmtTs();
@@ -175,9 +217,9 @@ function startClient(id) {
                 [toAddr, myAddr, msgText, 0, contactName, chatType, message.deviceType || 'unknown', ts]
             );
             const result = await getDb().run(
-                `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, timestamp)
-                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [myAddr, toAddr, msgText, 0, pushname, chatType, message.deviceType || 'unknown', waId || null, ts]
+                `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, quoted_message, quoted_author, timestamp)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [myAddr, toAddr, msgText, 0, pushname, chatType, message.deviceType || 'unknown', waId || null, quotedMessage, quotedAuthor, ts]
             );
             const newId = result.lastID;
 
@@ -252,6 +294,8 @@ function startClient(id) {
             [message.from]
         );
 
+        const { quotedMessage, quotedAuthor } = await extractQuoted(message, clients[id]);
+
         const ts = fmtTs();
         await getDb().run(
             `INSERT INTO chats(sender, receiver, message, status, sender_name, chat_type, device_type, unread_count, last_from_me, timestamp)
@@ -260,15 +304,34 @@ function startClient(id) {
         );
 
         const result = await getDb().run(
-            `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, timestamp)
-             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [message.from, message.to, msg, 0, senderNameForMessages, message.type, message.deviceType, waId, ts]
+            `INSERT INTO messages(sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, quoted_message, quoted_author, timestamp)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [message.from, message.to, msg, 0, senderNameForMessages, message.type, message.deviceType, waId, quotedMessage, quotedAuthor, ts]
         );
 
         const newId = result.lastID;
 
         if (message.hasMedia) {
             await persistMedia(message, newId);
+        }
+    });
+
+    // Reacciones (emoji) sobre un mensaje. reaction.reaction == '' significa que
+    // se quitó la reacción. Se identifica el mensaje por su wa_id (msgId serializado).
+    // Las reacciones NO cambian el timestamp del mensaje, así que la app detecta el
+    // cambio comparando una firma de reacciones (ver retrieveAndDisplayMessages).
+    clients[id].on('message_reaction', async (reaction) => {
+        try {
+            const targetWaId = reaction.msgId?._serialized;
+            if (!targetWaId) return;
+            const emoji = reaction.reaction || '';
+            const result = await getDb().run(
+                `UPDATE messages SET reaction = ? WHERE wa_id = ?`,
+                [emoji, targetWaId]
+            );
+            console.log(`[message_reaction] ${targetWaId} → "${emoji}" (filas: ${result.changes})`);
+        } catch (err) {
+            console.error('[message_reaction] error:', err.message);
         }
     });
 }
@@ -461,6 +524,10 @@ async function getMessages(receiver, sender, pageRaw, pageSizeRaw) {
             chatType:      row.chat_type,
             deviceType:    row.device_type,
             mediaFilename: row.media_filename,
+            waId:          row.wa_id,
+            reaction:      row.reaction || '',
+            quotedMessage: row.quoted_message || '',
+            quotedAuthor:  row.quoted_author || '',
             createdAt:     row.timestamp,
             updatedAt:     row.timestamp
         }));
@@ -739,12 +806,13 @@ async function syncHistory(id) {
                         : (msg._data?.notifyName || contactName);
                     const msgText    = msg.type === 'chat' ? (msg.body || '') : `${msg.type} received`;
                     const timestamp  = fmtTs(new Date(msg.timestamp * 1000));
+                    const { quotedMessage, quotedAuthor } = await extractQuoted(msg, client);
 
                     await getDb().run(
                         `INSERT INTO messages
-                         (sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, timestamp)
-                         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [sender, receiver, msgText, 0, senderName, msg.type || 'chat', 'history', waId, timestamp]
+                         (sender, receiver, message, status, sender_name, chat_type, device_type, wa_id, quoted_message, quoted_author, timestamp)
+                         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [sender, receiver, msgText, 0, senderName, msg.type || 'chat', 'history', waId, quotedMessage, quotedAuthor, timestamp]
                     );
                     lastMsg = msg;
                 }
@@ -778,14 +846,19 @@ async function syncHistory(id) {
     }
 }
 
-async function sendMessage(sender, receiver, message) {
+async function sendMessage(sender, receiver, message, quotedMessageId) {
     try {
         const client = clients[sender.replace("@c.us", "")];
         if (!client)
             return { status: 401, data: { statusCode: '002', statusDesc: 'User session not found' } };
 
+        // Si es una respuesta (reply), citar el mensaje original. La info de cita
+        // se persiste automáticamente en el evento message_create (single writer),
+        // que ve message.hasQuotedMsg en el mensaje que acabamos de enviar.
+        const options = quotedMessageId ? { quotedMessageId } : {};
+
         // Guardar wa_id del mensaje enviado para deduplicar con message_create
-        const sentMsg = await client.sendMessage(receiver, message);
+        const sentMsg = await client.sendMessage(receiver, message, options);
         const waId = sentMsg?.id?._serialized || null;
 
         // Don't insert into chats table here — message_create event will handle it
@@ -795,6 +868,32 @@ async function sendMessage(sender, receiver, message) {
     } catch (error) {
         const firstLine = error.message.split(/\r?\n/)[0];
         console.error(firstLine);
+        return { status: 500, data: { error: firstLine } };
+    }
+}
+
+// Reacciona (emoji) a un mensaje identificado por su wa_id. emoji === '' quita la reacción.
+async function reactToMessage(sender, waId, emoji) {
+    try {
+        const client = clients[sender.replace("@c.us", "")];
+        if (!client)
+            return { status: 401, data: { error: 'User session not found' } };
+        if (!waId)
+            return { status: 400, data: { error: 'wa_id required' } };
+
+        const msg = await client.getMessageById(waId);
+        if (!msg)
+            return { status: 404, data: { error: 'Message not found' } };
+
+        await msg.react(emoji || '');
+
+        // Reflejar de inmediato en la BD (el evento message_reaction también lo hará).
+        await getDb().run(`UPDATE messages SET reaction = ? WHERE wa_id = ?`, [emoji || '', waId]);
+
+        return { status: 200, data: { message: 'reaction sent', emoji: emoji || '' } };
+    } catch (error) {
+        const firstLine = (error.message || '').split(/\r?\n/)[0];
+        console.error('[reactToMessage]', firstLine);
         return { status: 500, data: { error: firstLine } };
     }
 }
@@ -861,7 +960,7 @@ async function getContactInfo(mobileNumber, contactId) {
 }
 
 module.exports = {
-    startClient, clientExists, sendMessage, getStatus, validate,
+    startClient, clientExists, sendMessage, reactToMessage, getStatus, validate,
     getAllChats, getAllMessages, loginUser, logoutUser,
     getChats, getContacts, uploadMedia, getMessages, listUsers,
     getProfilePic, getContactInfo
