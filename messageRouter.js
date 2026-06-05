@@ -4,7 +4,7 @@ const path    = require('path');
 const router  = new express.Router();
 
 const {
-  startClient, clientExists, sendMessage, getStatus, validate, getContactInfo,
+  startClient, clientExists, sendMessage, reactToMessage, getStatus, validate, getContactInfo,
   getAllChats, getAllMessages, loginUser, logoutUser,
   getChats, getContacts, uploadMedia, getMessages, listUsers, getProfilePic
 } = require("./WhatsappClient")
@@ -143,7 +143,18 @@ router.get('/api/messages/:receiver/:sender', async (req, res) => {
 });
 
 router.post(['/api/messages', '/api/messages/:id'], async (req, res) => {
-    const result = await sendMessage(req.body.sender, req.body.receiver, req.body.message);
+    // quotedMessageId (opcional): wa_id del mensaje al que se responde (reply/cita).
+    const result = await sendMessage(
+        req.body.sender, req.body.receiver, req.body.message, req.body.quotedMessageId
+    );
+    res.status(result.status).json(result.data);
+});
+
+// Reacciona a un mensaje (emoji). Body: { sender, waId, emoji }. emoji '' quita la reacción.
+router.post('/api/react', async (req, res) => {
+    const sender = String(req.body.sender ?? '').replace(BB_WIFI_REGEX, "");
+    const waId   = String(req.body.waId ?? '').replace(BB_WIFI_REGEX, "");
+    const result = await reactToMessage(sender, waId, req.body.emoji ?? '');
     res.status(result.status).json(result.data);
 });
 

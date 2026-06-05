@@ -79,6 +79,18 @@ async function initializeDatabase() {
         await db.exec(`ALTER TABLE chats ADD COLUMN last_from_me INTEGER DEFAULT 0`);
         console.log(`chats: columna last_from_me añadida.`);
     } catch (_) {}
+    try {
+        // Emoji de la reacción sobre este mensaje ('' o NULL = sin reacción).
+        // Se actualiza vía el evento message_reaction y al reaccionar desde la app.
+        await db.exec(`ALTER TABLE messages ADD COLUMN reaction TEXT`);
+        console.log(`messages: columna reaction añadida.`);
+    } catch (_) {}
+    try {
+        // Cita (reply): texto y autor del mensaje al que este responde.
+        await db.exec(`ALTER TABLE messages ADD COLUMN quoted_message TEXT`);
+        await db.exec(`ALTER TABLE messages ADD COLUMN quoted_author TEXT`);
+        console.log(`messages: columnas quoted_message/quoted_author añadidas.`);
+    } catch (_) {}
 
     // Indexes
     await db.exec(`CREATE INDEX IF NOT EXISTS idx_chats_receiver  ON chats(receiver)`);
