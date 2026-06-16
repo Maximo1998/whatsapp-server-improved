@@ -1,6 +1,7 @@
 
 const express = require('express');
 const path    = require('path');
+const fs      = require('fs');
 const router  = new express.Router();
 
 const {
@@ -18,6 +19,20 @@ function parseIntParam(raw, defaultVal) {
 
 router.get('/', (req, res) => {
     res.sendFile('/index.html', { root: __dirname });
+});
+
+// Versión actual del APK Android para OTA updates.
+// Lee version.json del root del servidor. Si apk_url es relativa la convierte en absoluta.
+router.get('/api/version', (req, res) => {
+    try {
+        const info = JSON.parse(fs.readFileSync(path.join(__dirname, 'version.json'), 'utf8'));
+        if (info.apk_url && !info.apk_url.startsWith('http')) {
+            info.apk_url = req.protocol + '://' + req.get('host') + info.apk_url;
+        }
+        res.json(info);
+    } catch (e) {
+        res.status(404).json({ error: 'version.json not found' });
+    }
 });
 
 // Descarga de archivos de la app (ej. APK). Restringido al directorio raíz del servidor.
