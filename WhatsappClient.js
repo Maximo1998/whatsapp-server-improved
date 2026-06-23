@@ -923,8 +923,7 @@ async function getContactInfo(mobileNumber, contactId) {
 
         let name = "", phone = "", about = "";
 
-        // 1) Resolver el contacto. Para @lid, getContactById(lid).number devuelve
-        //    el TELÉFONO REAL (verificado: 222337689452755@lid → 34664687499).
+        // 1) Resolver el contacto. Para @lid, getContactById(lid).number devuelve el teléfono real.
         try {
             const contact = await client.getContactById(contactId);
             if (contact) {

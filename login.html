@@ -332,7 +332,7 @@
 
         function startTimer() {
             timer = setInterval(function () {
-                //qrImage.src = 'http://nokia4ever.com:3000/images/qr_' + phoneNumber + '.png?rand=' + Math.random();
+                //qrImage.src = '/images/qr_' + phoneNumber + '.png?rand=' + Math.random();
                 checkLoginStatus();
 
             }, 5000);
@@ -345,7 +345,7 @@
 
         function checkLoginStatus(){
 
-            fetch('http://nokia4ever.com:80/login-status/' + phoneNumber)
+            fetch('/login-status/' + phoneNumber)
                 .then(response => response.json()) // Parse the server's JSON response
                 .then(result => {
                     console.log('Success:', result);
@@ -386,7 +386,7 @@
 
             document.getElementById('messages').innerText = "Preparing to send request...";
 
-            fetch('http://nokia4ever.com:80/' + country + '/' + phoneNumber + '/start')
+            fetch('/' + country + '/' + phoneNumber + '/start')
             .then(response => response.json()) // Parse the server's JSON response
             .then(result => {
 
