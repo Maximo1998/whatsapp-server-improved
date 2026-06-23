@@ -1,4 +1,6 @@
 # whatsapp-server-improved
+[![License: MIT](https://img.shields.io/badge/License-MIT-brightgreen.svg)](LICENSE) [![Node.js](https://img.shields.io/badge/Node.js-16%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org) [![whatsapp-web.js](https://img.shields.io/badge/whatsapp--web.js-latest-25D366?logo=whatsapp&logoColor=white)](https://github.com/pedroslopez/whatsapp-web.js) [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%23FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/maxlakh1m)
+
 
 A self-hosted WhatsApp bridge server that lets a modified **BlackBerry Q20** (running
 the *Novel Messenger* BB10 client) send and receive WhatsApp messages, keeping all
