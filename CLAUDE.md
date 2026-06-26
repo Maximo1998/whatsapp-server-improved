@@ -210,6 +210,8 @@ Cloudflare Edge ──── Zero Trust Tunnel ────► cloudflared (cont
 | `GET` | `/api/profilepic/:user/:contactId` | Contact profile picture (cached) |
 | `GET` | `/api/allchats/:user` | Live chats from WA (no DB) |
 | `GET` | `/api/allmessages/:user/:chatId` | Live messages from WA (no DB) |
+| `GET` | `/api/version` | Latest APK version + `apk_url` (OTA update check) — reads `version.json` |
+| `GET` | `/download/:filename` | Download a file from the server root (e.g. the APK); path-restricted |
 | `GET` | `/listusers` | Active sessions (HTML) |
 
 ---
@@ -273,6 +275,13 @@ and `android:largeHeap="true"`.
   messages sent from another device).
 - Auto-migrations on boot add new columns if missing. Indexes on `chats(receiver)`,
   `chats(sender)`, `messages(receiver,sender)`, `messages(sender,receiver)`, `messages(wa_id)`.
+
+### Client OTA updates (`version.json`)
+`whatsapp-server-improved/version.json` holds `{ "version", "apk_url" }` pointing at the
+latest BB10 APK on the Android client's GitHub Releases. The BB10 app polls `GET /api/version`
+to detect updates (`/api/version` rewrites a relative `apk_url` to an absolute one using the
+request host). **This file is the release marker** — the `release: bump Android app to vX.Y.Z`
+commits on `main` are version.json bumps that follow an Android CI build, not server code changes.
 
 ### Contacts
 `/api/contacts` returns only **saved address-book contacts** (`isMyContact`),
