@@ -250,10 +250,14 @@ function startClient(id) {
     });
 
     clients[id].on('message', async message => {
+      try {
         console.log(`Message from: ${message.from}`);
 
-        const waUser = await message.getContact();
-        const waChat = await message.getChat();
+        // getChat() puede lanzar en la build actual de WA Web (fetchBizProfile →
+        // "reading 'id'"). Solo se usa para el nombre de grupo, así que toleramos
+        // el fallo en vez de dejar que un rechazo no capturado tumbe el proceso.
+        let waChat = null;
+        try { waChat = await message.getChat(); } catch (e) { console.error('[message] getChat:', e.message); }
 
         let msg;
         if (message.type == 'ptt')        msg = 'Voice received';
@@ -281,7 +285,7 @@ function startClient(id) {
         let senderNameForChat     = message._data.notifyName;
         let senderNameForMessages = message._data.notifyName;
 
-        if (waChat.isGroup)          senderNameForChat     = waChat.name;
+        if (waChat?.isGroup)         senderNameForChat     = waChat.name;
         if (!senderNameForMessages)  senderNameForMessages = message.from;
         if (!senderNameForChat)      senderNameForChat     = message.from;
 
@@ -314,6 +318,9 @@ function startClient(id) {
         if (message.hasMedia) {
             await persistMedia(message, newId);
         }
+      } catch (err) {
+        console.error('[message] error:', err.message);
+      }
     });
 
     // Reacciones (emoji) sobre un mensaje. reaction.reaction == '' significa que
