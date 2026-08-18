@@ -2,7 +2,13 @@
 const express = require('express');
 const path    = require('path');
 const fs      = require('fs');
+const { execFile } = require('child_process');
 const router  = new express.Router();
+
+// Caché de miniaturas ligeras (imágenes y primer fotograma de vídeo) para el BB10,
+// que tiene poca memoria: la burbuja del chat carga la miniatura, no el original.
+const THUMBS_DIR = path.resolve(__dirname, 'cache', 'thumbs');
+try { fs.mkdirSync(THUMBS_DIR, { recursive: true }); } catch (_) {}
 
 const {
   startClient, clientExists, sendMessage, reactToMessage, getStatus, validate, getContactInfo,
@@ -58,6 +64,29 @@ router.get('/api/mediafile/:filename', function(req, res) {
         return res.status(403).json({ error: 'Access denied' });
     }
     res.download(file);
+});
+
+// Miniatura ligera para la burbuja del chat (BB10 tiene poca RAM). Genera con FFMPEG
+// un JPEG de ≤256px (primer fotograma si es vídeo), lo cachea en cache/thumbs/ y lo
+// reutiliza. Restringido a ./media/. Si falla la generación, sirve el original.
+router.get('/api/thumbnail/:filename', (req, res) => {
+    const filename = path.basename(req.params.filename.replace(BB_WIFI_REGEX, ""));
+    const src      = path.resolve(__dirname, 'media', filename);
+    const mediaDir = path.resolve(__dirname, 'media') + path.sep;
+    if (!src.startsWith(mediaDir)) return res.status(403).json({ error: 'Access denied' });
+    if (!fs.existsSync(src))       return res.status(404).json({ error: 'Not found' });
+
+    const thumb = path.join(THUMBS_DIR, filename.replace(/[^a-zA-Z0-9._-]/g, '_') + '.jpg');
+    if (fs.existsSync(thumb)) return res.sendFile(thumb);
+
+    execFile('ffmpeg', [
+        '-y', '-i', src,
+        '-vf', 'scale=256:256:force_original_aspect_ratio=decrease',
+        '-frames:v', '1', '-q:v', '6', thumb
+    ], (err) => {
+        if (err || !fs.existsSync(thumb)) return res.sendFile(src); // fallback al original
+        res.sendFile(thumb);
+    });
 });
 
 router.get('/login', (req, res) => {
@@ -163,6 +192,32 @@ router.post(['/api/messages', '/api/messages/:id'], async (req, res) => {
         req.body.sender, req.body.receiver, req.body.message, req.body.quotedMessageId
     );
     res.status(result.status).json(result.data);
+});
+
+// Borra un mensaje del chat (fila en BD) y su multimedia del disco (archivo + thumb).
+// Borrado local (no revoca en WhatsApp). :id es el _id del mensaje.
+router.post('/api/delete-message/:id', async (req, res) => {
+    try {
+        const id = parseInt(String(req.params.id).replace(BB_WIFI_REGEX, ""), 10);
+        if (isNaN(id)) return res.status(400).json({ error: 'bad id' });
+
+        const { db } = require('./connect');
+        const row = await db().get('SELECT media_filename FROM messages WHERE _id = ?', [id]);
+        if (!row) return res.status(404).json({ error: 'not found' });
+
+        await db().run('DELETE FROM messages WHERE _id = ?', [id]);
+
+        if (row.media_filename) {
+            const mf = path.basename(row.media_filename);
+            try { fs.unlinkSync(path.resolve(__dirname, 'media', mf)); } catch (_) {}
+            try { fs.unlinkSync(path.join(THUMBS_DIR, mf.replace(/[^a-zA-Z0-9._-]/g, '_') + '.jpg')); } catch (_) {}
+        }
+        console.log(`[delete-message] _id=${id} borrado (media=${row.media_filename || '-'})`);
+        res.status(200).json({ status: 'ok' });
+    } catch (error) {
+        console.error('[delete-message] error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
 });
 
 // Reacciona a un mensaje (emoji). Body: { sender, waId, emoji }. emoji '' quita la reacción.
