@@ -24,7 +24,8 @@ public IP, a Cloudflare tunnel exposes the service securely to the internet.
   the repo the running server is built from; **all server changes go here** (git remote `origin`).
 - **Server (public mirror):** https://github.com/Maximo1998/whatsapp-bb10-server (git remote `public`) —
   public-facing mirror only. Not the deployment source; push here only to publish, never develop against it.
-- **Android client:** https://github.com/Maximo1998/whatsapp-client-android_BBOS10 (branch `improved`, built by GitHub Actions)
+- **Android client:** https://github.com/Maximo1998/whatsapp-client-android_BBOS10 (branch **`master`** — the
+  live line, at v1.5.9+; the `improved` branch is **stale** at v1.4.1, do not use it). Built by GitHub Actions.
 
 ## System Requirements
 - **Server:** Debian (`tiny-server`).
@@ -72,7 +73,11 @@ public IP, a Cloudflare tunnel exposes the service securely to the internet.
   (`Maximo1998/whatsapp-bb10-server`) is a public mirror — push there to publish, but develop
   against `origin`.
 - The Android client lives in `app/whatsapp-client-android/` and builds on GitHub
-  Actions (push to the `improved` branch); it does **not** build locally.
+  Actions. **The live client branch is `master`** (push there → `release.yml` builds the APK,
+  publishes a GitHub Release `vX.Y.Z` from `app/build.gradle` `versionName`, and bumps the server
+  `version.json`). The `improved` branch is stale (v1.4.1) — do **not** develop against it. The client
+  does **not** build locally (no Android SDK/JDK on this machine). OTA delivery to the Q20 also needs the
+  **deployment's** local `version.json` bumped + container rebuilt — `/api/version` serves the baked-in file.
 
 ### Running & building
 - There is **no local Node run path and no tests/lint.** Everything runs in Docker.
