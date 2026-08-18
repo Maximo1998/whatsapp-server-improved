@@ -3,6 +3,7 @@ const express = require('express');
 const path    = require('path');
 const fs      = require('fs');
 const { execFile } = require('child_process');
+const qrImage = require('qr-image');
 const router  = new express.Router();
 
 // Caché de miniaturas ligeras (imágenes y primer fotograma de vídeo) para el BB10,
@@ -95,6 +96,24 @@ router.get('/login', (req, res) => {
 
 router.get("/login-status/:phoneNumber", (req, res) => {
     res.json(getStatus(req.params.phoneNumber))
+});
+
+// QR generado en el SERVIDOR (SVG) para la página de login.
+// Evita depender de una librería QR en el cliente o de un CDN externo
+// (era el motivo por el que el QR no aparecía). Se sirve como imagen.
+router.get('/qr/:phoneNumber', (req, res) => {
+    const phone = String(req.params.phoneNumber).replace(BB_WIFI_REGEX, '');
+    const status = getStatus(phone);
+    if (!status || !status.qr) return res.status(404).send('no qr');
+    try {
+        const svg = qrImage.imageSync(status.qr, { type: 'svg', margin: 1 });
+        res.setHeader('Content-Type', 'image/svg+xml');
+        res.setHeader('Cache-Control', 'no-store');
+        return res.send(svg);
+    } catch (e) {
+        console.error('qr svg error:', e);
+        return res.status(500).send('qr error');
+    }
 });
 
 router.get('/:country/:phoneNumber/start', (req, res) => {
