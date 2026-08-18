@@ -256,6 +256,31 @@ suffix (`@c.us`, `@lid`, `@g.us`) instead of corrupting it.
 `window.Store.ProfilePicThumb.find(wid)` via `pupPage.evaluate`, which returns a
 model with `.eurl`. Implemented in `fetchProfilePicUrlSafe()`; results cached on disk for 24h.
 
+### `id._serialized` renamed to `$1` — use `serializedId()` everywhere (jul-2026)
+WhatsApp Web (build 2.3000.104xxxx) **renamed the message/wid id property
+`_serialized` to `$1`**, so on whatsapp-web.js 1.34.6 `message.id._serialized` is
+`undefined` for **every** message. This silently broke `wa_id` dedup, reactions,
+contact ids, history sync, and **media download** (which needs the serialized id to
+look the model up in the page). The fix is the dual-compat helper **`serializedId(idObj)`**
+(`_serialized` → `$1` → manual reconstruction from `fromMe/remote/id` for messages or
+`user@server` for wids). **Never read `.id._serialized` directly — always go through
+`serializedId()`.** This is a moving target: the `$1` name is minified and may change,
+which is why the helper also reconstructs from parts.
+
+### Media download broken → `downloadMediaSafe()` (jul-2026)
+`message.downloadMedia()` (whatsapp-web.js 1.34.x) calls
+`Store.DownloadManager.downloadAndMaybeDecrypt(...)`, which the current WA Web build
+makes throw an opaque minified error (`r: r`) for **all** media (upstream issues
+wwebjs #201828 / #201833; **no npm release fixes it** — the fix only exists on the
+library's `main` branch, unpublished). `persistMedia()` now calls **`downloadMediaSafe()`**
+instead, which mirrors `main`'s approach without upgrading the lib: it looks the msg up
+via `serializedId()`, then reads the **already-decrypted blob from WA's
+`InMemoryMediaBlobCache`** (`window.Store.BlobCache`) — the cache WA auto-fills on
+receipt — and only falls back to the internal `msg.downloadMedia({...})` (in its own
+try/catch, since it may throw) when the blob isn't cached yet. Verified working for
+received **and** fromMe multi-device images. Both quirks share the root cause with the
+profile-pic workaround: WA Web internals shifted and the pinned library lags.
+
 ### Server-authoritative timestamps
 The BlackBerry Q20 has an outdated tz database and applies the wrong DST (message
 times showed 1h behind). The **server is the source of truth for time**: `fmtTs()`

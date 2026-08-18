@@ -27,6 +27,26 @@ function normalizeAddr(addr) {
     return addr + '@c.us';                 // número sin sufijo → añadir @c.us
 }
 
+// Devuelve el id serializado de un objeto id de whatsapp-web.js (mensaje o wid de
+// contacto/chat), tolerando la rotura de WhatsApp Web de jul-2026: la build actual
+// renombró la propiedad `_serialized` a `$1`, así que whatsapp-web.js 1.34.x lee
+// undefined y se rompen dedup (wa_id), reacciones, contactos y descarga de media.
+// Dual-compat: _serialized → $1 → reconstrucción manual desde las partes.
+function serializedId(idObj) {
+    if (!idObj) return null;
+    if (idObj._serialized) return idObj._serialized;
+    if (idObj.$1) return idObj.$1;
+    if (idObj.remote != null && idObj.id != null) {          // id de mensaje
+        const fromMe = idObj.fromMe ? 'true' : 'false';
+        const suffix = idObj.self === 'out' ? '_out' : (idObj.self === 'in' ? '_in' : '');
+        return `${fromMe}_${idObj.remote}_${idObj.id}${suffix}`;
+    }
+    if (idObj.user != null && idObj.server != null) {         // wid de contacto/chat
+        return `${idObj.user}@${idObj.server}`;
+    }
+    return null;
+}
+
 // Zona horaria de visualización. El cliente (BlackBerry Q20) tiene una base de
 // datos de zonas horarias obsoleta y aplica mal el horario de verano (muestra la
 // hora 1h atrasada). Por eso el SERVIDOR es la fuente de la hora: formatea los
@@ -58,6 +78,85 @@ function ffmpegPromise(inputPath, outputPath, options = []) {
     });
 }
 
+// Descarga segura de multimedia — workaround para la rotura de WhatsApp Web de
+// jul-2026. El `message.downloadMedia()` de whatsapp-web.js 1.34.x llama a
+// `Store.DownloadManager.downloadAndMaybeDecrypt(...)`, que en la build actual de
+// WA Web lanza un error minificado opaco (`r: r`) para TODO el media entrante
+// (issues wwebjs #201828 / #201833; sin release en npm que lo arregle). La rama
+// `main` de la librería lo reescribió: en vez de llamar a DownloadManager, invoca
+// el `downloadMedia()` interno del propio modelo de mensaje de WA (siempre acorde
+// a la build viva) y lee el blob descifrado desde el InMemoryMediaBlobCache.
+// Aquí reproducimos ese camino usando los objetos que 1.34.6 ya inyecta en la
+// página (`window.Store.Msg`, `window.Store.BlobCache`), sin actualizar la lib.
+// Devuelve { data(base64), mimetype, filename, filesize } o undefined.
+async function downloadMediaSafe(message) {
+    if (!message.hasMedia) return undefined;
+    const msgSerializedId = serializedId(message.id) || serializedId(message._data && message._data.id);
+    if (!msgSerializedId) return undefined;
+    try {
+        const result = await message.client.pupPage.evaluate(async (msgId) => {
+          const out = { step: 'start' };
+          try {
+            const Msg = window.Store.Msg;
+            let msg = Msg.get(msgId);
+            if (!msg) {
+                out.step = 'getMessagesById';
+                try { msg = (await Msg.getMessagesById([msgId]))?.messages?.[0]; } catch (_) {}
+            }
+            if (!msg || !msg.mediaData) { out.step = 'no-msg'; return out; }
+            if (msg.mediaData.mediaStage === 'REUPLOADING') { out.step = 'reuploading'; return out; }
+
+            // Recupera el blob descifrado que WA guarda en su caché en memoria. Este
+            // camino NO invoca el DownloadManager roto: WA rellena la caché al recibir
+            // y renderizar el media. Fallback a mediaObject.mediaBlob.forceToBlob().
+            const getCachedBlob = () => {
+                try {
+                    const fh = msg.mediaObject && msg.mediaObject.filehash;
+                    const c = fh && window.Store.BlobCache.InMemoryMediaBlobCache.get(fh);
+                    if (c) return c;
+                    const mb = msg.mediaObject && msg.mediaObject.mediaBlob;
+                    if (mb && typeof mb.forceToBlob === 'function') return mb.forceToBlob();
+                } catch (_) {}
+                return null;
+            };
+
+            // 1) Blob ya cacheado (lo normal para media recibido: WA lo auto-descarga).
+            let blob = getCachedBlob();
+
+            // 2) Si no hay blob aún, fuerza el downloadMedia interno de WA. En la build
+            //    actual puede lanzar (DownloadManager roto), pero lo toleramos: a menudo
+            //    deja igualmente el blob en la caché, que releemos a continuación.
+            if (!blob) {
+                out.step = 'force-download';
+                try { await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1, isUserInitiated: true }); } catch (_) {}
+                blob = getCachedBlob();
+            }
+            if (!blob) { out.step = 'no-blob'; return out; }
+
+            out.step = 'read';
+            const data = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(String(fr.result).split(',')[1]);
+                fr.onerror = () => reject(fr.error);
+                fr.readAsDataURL(blob);
+            });
+            return { data, mimetype: msg.mimetype, filename: msg.filename, filesize: msg.size };
+          } catch (e) {
+            out.error = e && e.message; return out;
+          }
+        }, msgSerializedId);
+
+        if (!result || !result.data) {
+            console.error(`[downloadMediaSafe] sin media (${msgSerializedId}):`, JSON.stringify(result));
+            return undefined;
+        }
+        return result;
+    } catch (e) {
+        console.error('[downloadMediaSafe] outer error:', e && e.message);
+        return undefined;
+    }
+}
+
 // Descarga el multimedia de un mensaje, lo guarda en ./media/ (convirtiendo
 // audio→mp3 y vídeo→3gp para compatibilidad con BB10) y enlaza el archivo en
 // la fila de messages vía media_filename. Decide el tipo por el MIME real del
@@ -66,7 +165,7 @@ function ffmpegPromise(inputPath, outputPath, options = []) {
 // Usado tanto por el evento 'message' (recibidos) como por 'message_create' (enviados).
 async function persistMedia(message, newId) {
     try {
-        const media = await message.downloadMedia();
+        const media = await downloadMediaSafe(message);
         if (!media || !media.mimetype) {
             console.log(`[persistMedia ${newId}] sin media descargable`);
             return;
@@ -188,7 +287,7 @@ function startClient(id) {
         if (!message.fromMe) return; // los recibidos los gestiona el evento 'message'
         if (!clients[id]?.info) return;
 
-        const waId = message.id?._serialized;
+        const waId = serializedId(message.id);
 
         // Deduplicar: saltar si ya fue guardado por sendMessage() o por sincronización anterior
         if (waId) {
@@ -271,7 +370,7 @@ function startClient(id) {
 
         if (message.from === 'status@broadcast') return;
 
-        const waId = message.id?._serialized;
+        const waId = serializedId(message.id);
 
         // Deduplicate: skip if already in DB (from uploadMedia or previous sync)
         if (waId) {
@@ -329,7 +428,7 @@ function startClient(id) {
     // cambio comparando una firma de reacciones (ver retrieveAndDisplayMessages).
     clients[id].on('message_reaction', async (reaction) => {
         try {
-            const targetWaId = reaction.msgId?._serialized;
+            const targetWaId = serializedId(reaction.msgId);
             if (!targetWaId) return;
             const emoji = reaction.reaction || '';
             const result = await getDb().run(
@@ -564,7 +663,7 @@ async function getContacts(mobileNumber, searchTerm, pageRaw, pageSizeRaw) {
         // Excluimos también nuestra propia cuenta y grupos, y usamos la identidad @c.us.
         const filtered = contacts
             .filter(c => c.isMyContact && !c.isMe && !c.isGroup && c.id.server === "c.us")
-            .map(c => ({ id: c.id._serialized, name: c.name ?? c.pushname ?? c.id.user }))
+            .map(c => ({ id: serializedId(c.id), name: c.name ?? c.pushname ?? c.id.user }))
             .filter(c => c.name.toLowerCase().includes(searchTerm.toLowerCase()))
             .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -620,7 +719,7 @@ async function uploadMedia(media, sender, receiver) {
         const mediaObject = MessageMedia.fromFilePath(targetPath);
         const sendAsVoice = (chatType === 'audio') ? { sendAudioAsVoice: true } : {};
         const sentMsg = await client.sendMessage(receiver, mediaObject, sendAsVoice);
-        const waId = sentMsg?.id?._serialized || null;
+        const waId = serializedId(sentMsg?.id) || null;
 
         console.log(`[uploadMedia] enviado ${chatType} a ${receiver}, wa_id: ${waId} (persistencia vía message_create)`);
 
@@ -788,7 +887,7 @@ async function syncHistory(id) {
 
         for (const waChat of waChats.slice(0, 30)) {
             try {
-                const contactAddr = waChat.id._serialized;
+                const contactAddr = serializedId(waChat.id);
                 const contactName = waChat.name || contactAddr;
                 const messages = await waChat.fetchMessages({ limit: 50 });
 
@@ -797,7 +896,7 @@ async function syncHistory(id) {
                 for (const msg of messages) {
                     if (msg.from === 'status@broadcast') continue;
 
-                    const waId = msg.id?._serialized;
+                    const waId = serializedId(msg.id);
                     if (!waId) continue;
 
                     // Saltar si ya está en BD
@@ -866,7 +965,7 @@ async function sendMessage(sender, receiver, message, quotedMessageId) {
 
         // Guardar wa_id del mensaje enviado para deduplicar con message_create
         const sentMsg = await client.sendMessage(receiver, message, options);
-        const waId = sentMsg?.id?._serialized || null;
+        const waId = serializedId(sentMsg?.id) || null;
 
         // Don't insert into chats table here — message_create event will handle it
         // This prevents duplicate chats when messages are sent
