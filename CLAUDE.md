@@ -20,7 +20,10 @@ public IP, a Cloudflare tunnel exposes the service securely to the internet.
 - **YouTube (tutorials):** https://youtube.com/@NovelProfessor
 
 ## Our forks
-- **Server (active):** https://github.com/Maximo1998/whatsapp-server-improved (branch `main`)
+- **Server (active):** https://github.com/Maximo1998/whatsapp-server-improved (branch `main`) — this is
+  the repo the running server is built from; **all server changes go here** (git remote `origin`).
+- **Server (public mirror):** https://github.com/Maximo1998/whatsapp-bb10-server (git remote `public`) —
+  public-facing mirror only. Not the deployment source; push here only to publish, never develop against it.
 - **Android client:** https://github.com/Maximo1998/whatsapp-client-android_BBOS10 (branch `improved`, built by GitHub Actions)
 
 ## System Requirements
@@ -64,7 +67,10 @@ public IP, a Cloudflare tunnel exposes the service securely to the internet.
 ### Git topology (important)
 - The deployment root `/home/max/novel-whats-srv/` is **NOT** a git repository.
 - The git repo is `whatsapp-server-improved/` (`origin` = `Maximo1998/whatsapp-server-improved`,
-  branch `main`). **All server commits/pushes happen from inside that subdirectory.**
+  branch `main`). **All server commits/pushes happen from inside that subdirectory**, and `origin`
+  is the source of truth the deployment is built from. A second remote `public`
+  (`Maximo1998/whatsapp-bb10-server`) is a public mirror — push there to publish, but develop
+  against `origin`.
 - The Android client lives in `app/whatsapp-client-android/` and builds on GitHub
   Actions (push to the `improved` branch); it does **not** build locally.
 
@@ -222,6 +228,19 @@ Cloudflare Edge ──── Zero Trust Tunnel ────► cloudflared (cont
 - The server uses **whatsapp-web.js** with **headless Chromium** (`--no-sandbox`).
 - Port 80 is only exposed on localhost (`127.0.0.1:3000`); external access always goes through the Cloudflare tunnel (HTTPS).
 - `shm_size: 256mb` in Docker is required so Chromium doesn't crash from low shared memory.
+
+### WA event handlers MUST be crash-proof (try/catch everything)
+Both containers run `restart: unless-stopped`. Because all session state is
+in-memory, **any unhandled rejection that kills Node is catastrophic**: the
+container restarts, the `clients`/`authenticatedClients`/`qrcodes` maps are lost,
+and the server re-emits a QR in a loop while the BB10 client shows "no session
+found" despite being logged in. On the current WA Web build, `message.getContact()`
+and `message.getChat()` can throw `TypeError: Cannot read properties of undefined
+(reading 'id')` (inside `fetchBizProfile`/`getContactById`). So every WA event
+handler (`message`, `message_create`, `message_reaction`) is wrapped in a top-level
+try/catch, and `getChat()` (used only for the group name via `waChat?.isGroup`) has
+its own inner try/catch with a `null` fallback. **When adding logic to these
+handlers, keep it inside the try/catch — an escaping throw takes down the process.**
 
 ### Multi-Device identities (`@lid`)
 WhatsApp uses the **LID** format (`number@lid`) for multi-device identities instead
